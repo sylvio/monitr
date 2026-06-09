@@ -52,6 +52,13 @@
     "unix-dgram": "^2.0.7"
   },
   "main": "./lib/monitor.js",
+  "files": [
+    "src/",
+    "lib/",
+    "binding.gyp",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "pretest": "eslint examples/*.js lib/*.js tests/*.js",
     "test": "nyc --report-dir artifacts/coverage --reporter text-summary --reporter lcov --cache=false node --expose-gc tests/test-monitor.js"
