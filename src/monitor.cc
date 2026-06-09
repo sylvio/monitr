@@ -19,9 +19,6 @@
 #include <fstream>
 #include <algorithm>
 
-// v8 compatibility templates
-#include "nan.h"
-
 #include "monitor.h"
 
 #ifdef __APPLE__
@@ -32,12 +29,7 @@
     extern char **environ;
 #endif
 
-#define THROW_BAD_ARGS() \
-    Nan::ThrowError(Exception::TypeError(Nan::New<String>(__FUNCTION__).ToLocalChecked()));
-
-
 using namespace std;
-using namespace v8;
 
 // This is the default IPC path where the stats are written to
 // Could use the setter method to change this
@@ -63,40 +55,23 @@ namespace ynode {
 // our singleton instance
 NodeMonitor* NodeMonitor::instance_ = NULL;
 
-// some utility functions to make code cleaner
-static inline v8::Local<v8::String> v8_str( const char* s ) {
-    Nan::MaybeLocal<v8::String> s_maybe = Nan::New<v8::String>(s);
-    return s_maybe.ToLocalChecked();
-}
-
-static inline v8::Local<v8::Value> getObjectProperty(const v8::Local<v8::Object>& object,
-                                                     const char* key) {
-    v8::Local<v8::String> keyString = v8_str(key);
-    Nan::MaybeLocal<v8::Value> value = Nan::Get(object, keyString);
-    if (value.IsEmpty()) {
-        return Nan::Undefined();
-    }
-    return value.ToLocalChecked();
-}
-
 /**
  * obtain reference to process.monitor from global object
  *
  * Preconditions:  process.monitor exists and is an object
+ *
+ * Must be called on the JS thread (i.e. inside a N-API callback).
  **/
-static v8::Local<v8::Object> getProcessMonitor() {
-    Nan::EscapableHandleScope scope;
-
-    v8::Local<v8::Object> global = Nan::GetCurrentContext()->Global();
-    v8::Local<v8::Value> process = getObjectProperty( global, "process" );
-    assert( Nan::Undefined() != process && process->IsObject());
+static Napi::Object getProcessMonitor(Napi::Env env) {
+    Napi::Object global = env.Global();
+    Napi::Value process = global.Get("process");
+    assert(process.IsObject());
 
     // monitr javascript interface library must create process.monitor
+    Napi::Value monitor = process.As<Napi::Object>().Get("monitor");
+    assert(monitor.IsObject());
 
-    v8::Local<v8::Value> monitor = getObjectProperty(process.As<v8::Object>(), "monitor" );
-    assert( Nan::Undefined() != monitor && monitor->IsObject());
-
-    return scope.Escape(monitor.As<v8::Object>());
+    return monitor.As<Napi::Object>();
 }
 
 
@@ -157,20 +132,20 @@ static void doSleep(int ms) {
 
 static void Interrupter(v8::Isolate* isolate, void *data) {
     const int kMaxFrames = 64;
-    v8::Local<StackTrace> stack = v8::StackTrace::CurrentStackTrace(isolate, kMaxFrames);
+    v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(isolate, kMaxFrames);
     const int frameCount = stack->GetFrameCount();
 
     fprintf(stderr, "Interrupted: (frames: %d of %d)\n", std::min(frameCount, kMaxFrames), frameCount);
     for (int i = 0; i < stack->GetFrameCount(); ++i ) {
-        v8::Local<StackFrame> frame = stack->GetFrame(
+        v8::Local<v8::StackFrame> frame = stack->GetFrame(
 #if defined(V8_MAJOR_VERSION) && (V8_MAJOR_VERSION >= 7)
              isolate, 
 #endif
              i );
         int line = frame->GetLineNumber();
         int col = frame->GetColumn();
-        Nan::Utf8String fn(frame->GetFunctionName());
-        Nan::Utf8String script(frame->GetScriptName());
+        v8::String::Utf8Value fn(isolate, frame->GetFunctionName());
+        v8::String::Utf8Value script(isolate, frame->GetScriptName());
 
         fprintf(stderr, "    at %s (%s:%d:%d)\n",
                 fn.length() == 0 ? "<anonymous>" : *fn, *script, line, col);
@@ -189,7 +164,7 @@ void* monitorNodeThread(void *arg) {
 
     NodeMonitor& monitor = NodeMonitor::getInstance();
     doSleep(REPORT_INTERVAL_MS);
-    while (true) {
+    while (!monitor.isStopRequested()) {
         if (hup_fired) {
             siginfo_t *siginfo = &savedSigInfo;
             fprintf(stderr, "Process %d received SIGHUP from pid %d\n", getpid(), siginfo->si_pid);
@@ -208,66 +183,61 @@ void* monitorNodeThread(void *arg) {
                 errorCounter = 0;
             }
         }
+        if (monitor.isStopRequested()) {
+            break;
+        }
         doSleep(REPORT_INTERVAL_MS);
     }
-    exit(0);
+    return NULL;
 }
 
-// Invoked when woken by monitr pthread via async_send
-NAUV_WORK_CB(UpdateStatisticsCallback) {
-    NodeMonitor::getInstance().setStatistics();
+// N-API getter for process.monitor.gc.count
+static Napi::Value GetterGCCount(const Napi::CallbackInfo& info) {
+    GCUsageTracker& tracker = NodeMonitor::getInstance().getGCUsageTracker();
+    return Napi::Number::New(info.Env(), static_cast<double>(tracker.totalCollections()));
 }
 
-static NAN_GETTER(GetterGCCount) {
-    NodeMonitor& monitor = NodeMonitor::getInstance();
-    GCUsageTracker& tracker = monitor.getGCUsageTracker();
-
-    info.GetReturnValue().Set(Nan::New<Number>(tracker.totalCollections()));
+// N-API getter for process.monitor.gc.elapsed (milliseconds)
+static Napi::Value GetterGCElapsed(const Napi::CallbackInfo& info) {
+    GCUsageTracker& tracker = NodeMonitor::getInstance().getGCUsageTracker();
+    return Napi::Number::New(info.Env(), tracker.totalElapsedTime() / (1000.0 * 1000.0));
 }
 
-static NAN_GETTER(GetterGCElapsed) {
-    NodeMonitor& monitor = NodeMonitor::getInstance();
-    GCUsageTracker& tracker = monitor.getGCUsageTracker();
-
-    info.GetReturnValue().Set(Nan::New<Number>(tracker.totalElapsedTime() / (1000.0 * 1000.0) ));
+// V8 GC prologue/epilogue callbacks.  N-API has no abstraction for these,
+// so we register them directly on the isolate (the "hybrid" part).
+static void startGC(v8::Isolate* /*isolate*/, v8::GCType type, v8::GCCallbackFlags /*flags*/) {
+    NodeMonitor::getInstance().getGCUsageTracker().StartGC(type);
 }
 
-static NAN_GC_CALLBACK(startGC) {
-    NodeMonitor& monitor = NodeMonitor::getInstance();
-    GCUsageTracker& tracker = monitor.getGCUsageTracker();
-    tracker.StartGC(type);
+static void stopGC(v8::Isolate* /*isolate*/, v8::GCType type, v8::GCCallbackFlags /*flags*/) {
+    NodeMonitor::getInstance().getGCUsageTracker().StopGC(type);
 }
 
-static NAN_GC_CALLBACK(stopGC) {
-    NodeMonitor& monitor = NodeMonitor::getInstance();
-    GCUsageTracker& tracker = monitor.getGCUsageTracker();
-    tracker.StopGC(type);
+void NodeMonitor::InstallGCEventCallbacks() {
+    isolate_->AddGCPrologueCallback(startGC);
+    isolate_->AddGCEpilogueCallback(stopGC);
 }
 
-static void InstallGCEventCallbacks() {
-    Nan::AddGCPrologueCallback(startGC);
-    Nan::AddGCEpilogueCallback(stopGC);
-}
-
-static void UninstallGCEventCallbacks() {
-    Nan::RemoveGCPrologueCallback(startGC);
-    Nan::RemoveGCEpilogueCallback(stopGC);
+void NodeMonitor::UninstallGCEventCallbacks() {
+    isolate_->RemoveGCPrologueCallback(startGC);
+    isolate_->RemoveGCEpilogueCallback(stopGC);
 }
 
 /**
  * Set up the singleton instance variable
  */
-void NodeMonitor::Initialize(v8::Isolate* isolate) {
+void NodeMonitor::Initialize(Napi::Env env) {
 
     // only one instance is allowed per process
     // \todo change this to be one per *isolate*
     if (instance_) {
         return;
     }
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
     assert(0 != isolate);
     instance_ = new NodeMonitor(isolate); // calls protected constructor
 
-    instance_->InitializeProcessMonitorGCObject();
+    instance_->InitializeProcessMonitorGCObject(env);
 }
 
 /**
@@ -300,27 +270,22 @@ void NodeMonitor::InitializeIPC() {
  * Set up process.monitor.gc object and accessors for count/elapsed
  * These can be read from Javascript user code space
  **/
-void NodeMonitor::InitializeProcessMonitorGCObject() {
-    Nan::HandleScope scope;
+void NodeMonitor::InitializeProcessMonitorGCObject(Napi::Env env) {
+    Napi::HandleScope scope(env);
 
-    v8::Local<v8::Object> monitor = getProcessMonitor();
+    Napi::Object monitor = getProcessMonitor(env);
 
     // Create an object called "gc" with accessors for count/elapsed
     // * count is # of times GC has run in this process
     // * elapsed is the total duration for GC in milliseconds
     //
-    // This is a "plain-old-data" object - i.e. it does not have
-    // any prototype and does not have a constructor function.
-    // For this reason, we don't need any FunctionTemplate etc.
-    // In addition, we only ever have one object per process, so
-    // an ObjectTemplate seems overkill as well.
-    {
-        v8::Local<v8::Object> gcObj = Nan::New<v8::Object>();
-        Nan::Set( monitor.As<v8::Object>(), v8_str("gc"), gcObj );
-
-        Nan::SetAccessor( gcObj, v8_str("count"), GetterGCCount, 0 );
-        Nan::SetAccessor( gcObj, v8_str("elapsed"), GetterGCElapsed, 0 );
-    }
+    // The accessors are read-only (getter, no setter).
+    Napi::Object gcObj = Napi::Object::New(env);
+    gcObj.DefineProperties({
+        Napi::PropertyDescriptor::Accessor<GetterGCCount>("count"),
+        Napi::PropertyDescriptor::Accessor<GetterGCElapsed>("elapsed"),
+    });
+    monitor.Set("gc", gcObj);
 }
 
 /**
@@ -330,7 +295,7 @@ void NodeMonitor::InitializeProcessMonitorGCObject() {
  * the monitor is started.
  * Spawns a thread to monitor stats every REPORT_INTERVAL_MS
  */
-void NodeMonitor::Start() {
+void NodeMonitor::Start(Napi::Env env) {
 
     assert( 0 != instance_ );
 
@@ -339,6 +304,7 @@ void NodeMonitor::Start() {
         return;
     }
     running_ = true;
+    stopRequested_ = false;
 
     InstallGCEventCallbacks();
     InitializeIPC();
@@ -362,12 +328,21 @@ void NodeMonitor::Start() {
     }
 
 
-    // Tell libuv to execute our callback function (updateStatistics)
-    // inside the libuv default event loop (the same as used by nodejs
-    // - i.e. inside the v8 Javascript context) when "signalled" by the
-    // monitr pthread via an uv_async_send
-    uv_async_init(uv_default_loop(), &check_loop_, &UpdateStatisticsCallback);
-    uv_unref((uv_handle_t*) &check_loop_);
+    // Create a thread-safe function so the monitr pthread can schedule
+    // setStatistics() back onto the JS thread.  This is the modern N-API
+    // replacement for the previous uv_async_t handle + uv_async_send.
+    //
+    // The JS callback is a no-op: the real work happens in the native
+    // [](Napi::Env, Napi::Function) callback passed to NonBlockingCall().
+    tsfn_ = Napi::ThreadSafeFunction::New(
+        env,
+        Napi::Function::New(env, [](const Napi::CallbackInfo&) {}),
+        "monitr",
+        0,   // unlimited queue
+        1);  // one producer thread (the monitr pthread)
+
+    // Don't let the monitor keep the event loop (and hence the process) alive.
+    tsfn_.Unref(env);
 
     // Go ahead and create the monitr pthread
     {
@@ -395,15 +370,15 @@ void NodeMonitor::Start() {
  * at the conclusion of the next reporting interval (REPORT_INTERVAL_MS)
  * by the monitr pthread
  **/
-void NodeMonitor::setStatistics() {
+void NodeMonitor::setStatistics(Napi::Env env) {
 
     pending_ = 0;
     loop_timestamp_ = uv_hrtime();
     loop_count_++;
 
-    {   // obtain heap memory usage ratio
+    {   // obtain heap memory usage ratio (V8 direct - no N-API equivalent)
         v8::HeapStatistics v8stats;
-        Nan::GetHeapStatistics(&v8stats);
+        isolate_->GetHeapStatistics(&v8stats);
 
         stats_.pmem_ = (v8stats.used_heap_size() / (double) v8stats.total_heap_size());
     }
@@ -417,7 +392,7 @@ void NodeMonitor::setStatistics() {
         cpuTrackerSync_.GetCurrent(&ucpu, &scpu, &uticks, &sticks);
 
         // Get total number of requests since monitr started
-        unsigned int totalReqs = getIntFunction("getTotalRequestCount");
+        unsigned int totalReqs = getIntFunction(env, "getTotalRequestCount");
         unsigned int reqDelta = totalReqs - stats_.lastRequests_;
 
         // Update the number of requests processed
@@ -448,21 +423,21 @@ void NodeMonitor::setStatistics() {
         stats_.lastRPS_ = (int) (stats_.lastReqDelta_ / ( timeDelta / 1000.0));
 
         // Get currently open requests
-        stats_.currentOpenReqs_ = getIntFunction("getRequestCount");
+        stats_.currentOpenReqs_ = getIntFunction(env, "getRequestCount");
 
         // currently open connections
-        stats_.currentOpenConns_ = getIntFunction("getOpenConnections");
+        stats_.currentOpenConns_ = getIntFunction(env, "getOpenConnections");
 
         // Kb of transferred data
-        float dataTransferred = ((float) (getIntFunction("getTransferred"))) / 1024;
+        float dataTransferred = ((float) (getIntFunction(env, "getTransferred"))) / 1024;
 
         stats_.lastKBytesSecond = (dataTransferred - stats_.lastKBytesTransfered_) / (((double) timeDelta) / 1000);
         stats_.lastKBytesTransfered_ = dataTransferred;
     }
 
-    stats_.healthIsDown_ = getBooleanFunction("isDown");
-    stats_.healthStatusCode_ = getIntFunction("getStatusCode");
-    stats_.healthStatusTimestamp_ = (time_t) getIntFunction("getStatusTimestamp");
+    stats_.healthIsDown_ = getBooleanFunction(env, "isDown");
+    stats_.healthStatusCode_ = getIntFunction(env, "getStatusCode");
+    stats_.healthStatusTimestamp_ = (time_t) getIntFunction(env, "getStatusTimestamp");
 
 }
 
@@ -577,23 +552,18 @@ void CpuUsageTracker::CalculateCpuUsage(CpuUsage* cur_usage,
         - (last_usage->stime_ticks + last_usage->cstime_ticks));
 }
 
-Local<Value> callFunction(const char* funcName) {
-    Nan::EscapableHandleScope scope;
-
-    v8::Local<v8::Object> monitor = getProcessMonitor();
+// Invoke a zero-arg function on process.monitor by name.
+// Returns the function's result, or null if it doesn't exist.
+// Must be called on the JS thread.
+static Napi::Value callFunction(Napi::Env env, const char* funcName) {
+    Napi::Object monitor = getProcessMonitor(env);
 
     // Does funcName function exist on process.monitor object?
-    Nan::MaybeLocal<v8::Value> fval = Nan::Get(monitor, v8_str(funcName));
-    if (!fval.IsEmpty() && fval.ToLocalChecked()->IsFunction()) {
-        v8::Local<v8::Object> global = Nan::GetCurrentContext()->Global();
-        Nan::Callback callback( fval.ToLocalChecked().As<v8::Function>() );
-
-        Local<v8::Value> result = callback(global, 0, 0 );
-
-        return scope.Escape(result);
+    Napi::Value fval = monitor.Get(funcName);
+    if (fval.IsFunction()) {
+        return fval.As<Napi::Function>().Call(env.Global(), {});
     }
-    return Nan::Null();
-
+    return env.Null();
 }
 
 
@@ -667,28 +637,21 @@ const GCStat GCUsageTracker::GCUsage::EndInterval() {
 }
 
 // calls a Javascript function which returns an integer result
-int NodeMonitor::getIntFunction(const char* funcName) {
-    Nan::HandleScope scope;
-    Local<Value> res = callFunction(funcName);
-    if (res->IsNumber()) {
-        uint32_t value = res->Uint32Value(Nan::GetCurrentContext()).FromJust();
-        return value;
+int NodeMonitor::getIntFunction(Napi::Env env, const char* funcName) {
+    Napi::HandleScope scope(env);
+    Napi::Value res = callFunction(env, funcName);
+    if (res.IsNumber()) {
+        return res.As<Napi::Number>().Uint32Value();
     }
     return 0;
 }
 
 // calls a Javascript function which returns a boolean result
-bool NodeMonitor::getBooleanFunction(const char* funcName) {
-    Nan::HandleScope scope;
-    Local<Value> res = callFunction(funcName);
-    if (res->IsBoolean()) {
-#if V8_MAJOR_VERSION > 6 // after Node.js 10
-        v8::Isolate* isolate = v8::Isolate::GetCurrent();
-        bool value = res->BooleanValue(isolate);
-#else
-        bool value = res->BooleanValue(Nan::GetCurrentContext()).FromJust();
-#endif
-        return value;
+bool NodeMonitor::getBooleanFunction(Napi::Env env, const char* funcName) {
+    Napi::HandleScope scope(env);
+    Napi::Value res = callFunction(env, funcName);
+    if (res.IsBoolean()) {
+        return res.As<Napi::Boolean>().Value();
     }
     return false;
 }
@@ -886,8 +849,12 @@ bool NodeMonitor::sendReport() {
         pending_ = 1;
     }
 
-    // notify libuv that it should run the UpdateStatistics callback
-    uv_async_send(&check_loop_);
+    // Schedule setStatistics() to run on the JS thread.  This replaces the
+    // old uv_async_send(): the TSFN marshals us back onto the event loop
+    // where it is safe to call into V8/JS.
+    tsfn_.NonBlockingCall([](Napi::Env env, Napi::Function /*jsCallback*/) {
+        NodeMonitor::getInstance().setStatistics(env);
+    });
     return (rc != -1);
 }
 
@@ -899,10 +866,34 @@ bool NodeMonitor::sendReport() {
 void NodeMonitor::Stop() {
     assert( 0 != instance_ );
 
+    if ( !running_ ) {
+        return;
+    }
+
     UninstallGCEventCallbacks();
 
-    pthread_cancel(tmonitor_);
+    // Ask the monitor thread to exit and wake it from its pselect() sleep
+    // by writing to the self-pipe, then wait for it to finish.
+    stopRequested_ = true;
+    if (sigpipefd_w != -1) {
+        char c = 0;
+        ssize_t rc = write(sigpipefd_w, &c, 1);
+        (void) rc;  // best-effort wakeup
+    }
+    pthread_join(tmonitor_, NULL);
+
+    // The producer thread is gone, so it is now safe to release the TSFN.
+    if (tsfn_) {
+        tsfn_.Release();
+        tsfn_ = Napi::ThreadSafeFunction();
+    }
+
     close(ipcSocket_);
+    ipcSocket_ = -1;
+
+    // Close the self-pipe so a subsequent Start() can recreate it cleanly.
+    if (sigpipefd_r != -1) { close(sigpipefd_r); sigpipefd_r = -1; }
+    if (sigpipefd_w != -1) { close(sigpipefd_w); sigpipefd_w = -1; }
 
     running_ = false;
 }
@@ -912,6 +903,7 @@ void NodeMonitor::Stop() {
  */
 NodeMonitor::NodeMonitor(v8::Isolate* isolate) :
     running_(false),
+    stopRequested_(false),
     startTime(0),
     gcTracker_(),
     tmonitor_((pthread_t) NULL),
@@ -949,53 +941,50 @@ static void SignalHangupActionHandler(int signo, siginfo_t* siginfo,  void* cont
 
 // Javascript interface routines
 // Javascript getter/setters
-static NAN_GETTER(GetterIPCMonitorPath) {
-    info.GetReturnValue().Set(Nan::New<String>(_ipcMonitorPath.c_str()).ToLocalChecked());
+static Napi::Value GetterIPCMonitorPath(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), _ipcMonitorPath);
 }
 
 
 // methods that can be called from Javascript
-static NAN_METHOD(SetterIPCMonitorPath) {
+static Napi::Value SetterIPCMonitorPath(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
     if (info.Length() < 1 ||
-        (!info[0]->IsString() && !info[0]->IsUndefined() && !info[0]->IsNull())) {
-        THROW_BAD_ARGS();
+        (!info[0].IsString() && !info[0].IsUndefined() && !info[0].IsNull())) {
+        Napi::TypeError::New(env, "setIpcMonitorPath: expected a string path")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
     }
-    Nan::Utf8String ipcMonitorPath(info[0]);
-    _ipcMonitorPath = *ipcMonitorPath;
+    if (info[0].IsString()) {
+        _ipcMonitorPath = info[0].As<Napi::String>().Utf8Value();
+    }
+    return env.Undefined();
 }
 
-static NAN_METHOD(StartMonitor) {
-    NodeMonitor::getInstance().Start();
+static Napi::Value StartMonitor(const Napi::CallbackInfo& info) {
+    NodeMonitor::getInstance().Start(info.Env());
+    return info.Env().Undefined();
 }
 
-static NAN_METHOD(StopMonitor) {
+static Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
     NodeMonitor::getInstance().Stop();
+    return info.Env().Undefined();
 }
 
 
 // main module initialization
-NAN_MODULE_INIT(init) {
-    // target is defined in the NAN_MODULE_INIT macro as ADDON_REGISTER_FUNCTION_ARGS_TYPE
-    //  -- i.e. v8::Local<v8::Object> for nodejs-3.x and up,
-    // but v8::Handle<v8::Object> for nodejs-0.12.0
+static Napi::Object init(Napi::Env env, Napi::Object exports) {
+    exports.DefineProperty(
+        Napi::PropertyDescriptor::Accessor<GetterIPCMonitorPath>("ipcMonitorPath"));
+    exports.Set("setIpcMonitorPath", Napi::Function::New(env, SetterIPCMonitorPath));
+    exports.Set("start", Napi::Function::New(env, StartMonitor));
+    exports.Set("stop", Napi::Function::New(env, StopMonitor));
 
-#if NODE_MODULE_VERSION < IOJS_3_0_MODULE_VERSION
-    Local<Object> exports = Nan::New<Object>(target);
-#else
-    Local<Object> exports = target;
-#endif
-
-    Nan::SetAccessor( exports, Nan::New("ipcMonitorPath").ToLocalChecked(),
-                      GetterIPCMonitorPath, 0, v8::Local<v8::Value>(),
-                      v8::DEFAULT, v8::DontDelete );
-    Nan::Export( exports, "setIpcMonitorPath", SetterIPCMonitorPath);
-    Nan::Export( exports, "start", StartMonitor);
-    Nan::Export( exports, "stop", StopMonitor);
-
-    NodeMonitor::Initialize(v8::Isolate::GetCurrent());
+    NodeMonitor::Initialize(env);
     RegisterSignalHandler(SIGHUP, SignalHangupActionHandler);
 
+    return exports;
 }
 
-NODE_MODULE(monitor, init)
+NODE_API_MODULE(monitor, init)
 }

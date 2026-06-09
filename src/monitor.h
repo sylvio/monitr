@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <string.h>
 #include <limits.h>
+#include <cassert>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ipc.h>
@@ -28,6 +29,14 @@
 #include <list>
 #include <string>
 #include <vector>
+
+// node-addon-api provides the stable N-API binding layer.  We still reach
+// directly into V8 (v8.h) and libuv (uv.h) for the handful of capabilities
+// N-API intentionally does not expose: GC prologue/epilogue callbacks,
+// heap statistics, and isolate interrupts / stack traces.
+#include <napi.h>
+#include <v8.h>
+#include <uv.h>
 
 namespace ynode {
 
@@ -237,13 +246,18 @@ typedef struct {
 class NodeMonitor {
 public:
     /** Initializes the singleton.  Do not call any other functions
-     * unless this function has been called first 
+     * unless this function has been called first
      */
-    static void Initialize(v8::Isolate* isolate);
-         
-    void Start();
+    static void Initialize(Napi::Env env);
+
+    void Start(Napi::Env env);
     void Stop();
     virtual ~NodeMonitor();
+
+    /** True once Stop() has requested the monitor thread to exit.
+     * Read by the monitor pthread to break out of its reporting loop.
+     */
+    bool isStopRequested() const { return stopRequested_; }
   
     /** Returns isolate which this NodeMonitor object is monitoring
      *
@@ -253,8 +267,8 @@ public:
     GCUsageTracker& getGCUsageTracker() { return gcTracker_; }
 
     bool sendReport();
-    void setStatistics();
-  
+    void setStatistics(Napi::Env env);
+
     static NodeMonitor& getInstance();
 
 protected:
@@ -263,10 +277,13 @@ protected:
 
 private:
     void InitializeIPC();
-    void InitializeProcessMonitorGCObject(); //< Install process.monitor.gc
+    void InitializeProcessMonitorGCObject(Napi::Env env); //< Install process.monitor.gc
+    void InstallGCEventCallbacks();    //< hook V8 GC prologue/epilogue
+    void UninstallGCEventCallbacks();  //< unhook V8 GC prologue/epilogue
 
     // Member variables
     bool running_;  //< have we already been started?
+    volatile bool stopRequested_; //< set by Stop() to break the monitor thread loop
 
     time_t startTime;
   
@@ -281,9 +298,11 @@ private:
     GCUsageTracker gcTracker_; //< keeps track of gc events
     pthread_t tmonitor_;    //< the pthread doing the monitoring
     v8::Isolate* isolate_;  //< the isolate this monitor is monitoring
-  
-    uv_async_t check_loop_;
-  
+
+    // Modern replacement for the old uv_async_t handle: the monitor pthread
+    // schedules setStatistics() back onto the JS thread via this TSFN.
+    Napi::ThreadSafeFunction tsfn_;
+
     volatile unsigned int loop_count_;
     volatile unsigned int last_loop_count_;
     volatile uint64_t loop_timestamp_;
@@ -296,8 +315,8 @@ private:
     struct msghdr msg_;
     int ipcSocket_;
   
-    static int getIntFunction(const char* funcName);
-    static bool getBooleanFunction(const char* funcName);
+    static int getIntFunction(Napi::Env env, const char* funcName);
+    static bool getBooleanFunction(Napi::Env env, const char* funcName);
 
     static NodeMonitor* instance_;  //< the singleton instance
 

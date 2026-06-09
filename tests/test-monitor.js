@@ -1,15 +1,14 @@
-/* global describe,it,before,after */
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert');
+const dgram = require('unix-dgram');
+const fsp = require('node:fs').promises;
+const http = require('node:http');
+const monitor = require('../lib/monitor');
 
-var assert = require('assert'),
-    async = require('async'),
-    dgram = require('unix-dgram'),
-    fs = require('fs'),
-    http = require('http'),
-    monitor = require('../lib/monitor');
-var defaultIpcMonitorPath = '/tmp/nodejs.mon',
-    ipcMonitorPath = '/tmp/nodejs-test-' + process.pid + '.mon';
+const defaultIpcMonitorPath = '/tmp/nodejs.mon';
+const ipcMonitorPath = '/tmp/nodejs-test-' + process.pid + '.mon';
 
-var expectedProperties = [
+const expectedProperties = [
     'cluster',
     'cpu',
     'cpuperreq',
@@ -31,16 +30,24 @@ var expectedProperties = [
     'utcstart',
 ];
 
-var expectedGCCollectors = [
+const expectedGCCollectors = [
     'marksweep',
     'scavenge',
 ];
 
-var expectedGCStatProperties = [
+const expectedGCStatProperties = [
     'count',
     'elapsed_ms',
     'max_ms',
 ];
+
+// Bind a unix datagram socket while temporarily clearing the umask so the
+// socket file is world-writable (the monitor sends to it from a C++ thread).
+function bindWithOpenUmask(socket, path) {
+    const um = process.umask(0);
+    socket.bind(path);
+    process.umask(um);
+}
 
 describe('monitr', function() {
     describe('our own monitor path', function() {
@@ -56,6 +63,7 @@ describe('monitr', function() {
             monitor.setIpcMonitorPath(ipcMonitorPath);
             monitor.start();
         });
+
         after(function() {
             monitor.stop();
         });
@@ -72,7 +80,7 @@ describe('monitr', function() {
             it('has count and elapsed properties', function() {
                 assert.equal(typeof process.monitor.gc.count, 'number');
                 assert.equal(typeof process.monitor.gc.elapsed, 'number');
-                function getSetter( obj, prop ) {
+                function getSetter(obj, prop) {
                     return Object.getOwnPropertyDescriptor(obj, prop).set;
                 }
                 assert.ok(undefined === getSetter(process.monitor.gc, 'count'));
@@ -88,63 +96,46 @@ describe('monitr', function() {
     });
 
     describe('message sent from a server', function() {
-        var server, port;
-        var socket;
-        var topic = {};
+        let server, port;
+        let socket;
+        const topic = {};
 
-        before(function(done) {
-            async.series([
-                (taskDone) => {
-                    monitor.setIpcMonitorPath(ipcMonitorPath);
-                    monitor.start();
-                    taskDone();
-                },
-                (taskDone) => {
-                    server = http.createServer(function(req, res) {
-                        res.writeHead(200, {'Content-Type': 'text/plain'});
-                        res.end('I am being monitored\n');
-                    });
-                    server.listen(0, () => {
-                        port = server.address().port;
-                        taskDone();
-                    });
-                },
-                (taskDone) => {
-                    http.get('http://127.0.0.1:' + port, (res) => {
-                        res.on('data', () => {});   // drain response body
-                        topic.totalRequests = process.monitor.getTotalRequestCount();
-                        topic.requests = process.monitor.getRequestCount();
-                        topic.openConnections = process.monitor.getOpenConnections();
-                        topic.transferred = process.monitor.getTransferred();
-                        taskDone();
-                    }).on('error', taskDone);
-                },
-                (taskDone) => {
-                    socket = dgram.createSocket('unix_dgram', function(msg) {
-                        topic.msg = msg.toString();
-                        // we just grab one message
-                        taskDone();
-                    });
-                    var um = process.umask(0);
-                    socket.bind(monitor.ipcMonitorPath);
-                    process.umask(um);
-                },
-            ], done);
+        before(async function() {
+            monitor.setIpcMonitorPath(ipcMonitorPath);
+            monitor.start();
+
+            server = http.createServer(function(req, res) {
+                res.writeHead(200, {'Content-Type': 'text/plain'});
+                res.end('I am being monitored\n');
+            });
+            await new Promise((resolve) => server.listen(0, resolve));
+            port = server.address().port;
+
+            await new Promise((resolve, reject) => {
+                http.get('http://127.0.0.1:' + port, (res) => {
+                    res.on('data', () => {});   // drain response body
+                    topic.totalRequests = process.monitor.getTotalRequestCount();
+                    topic.requests = process.monitor.getRequestCount();
+                    topic.openConnections = process.monitor.getOpenConnections();
+                    topic.transferred = process.monitor.getTransferred();
+                    resolve();
+                }).on('error', reject);
+            });
+
+            await new Promise((resolve) => {
+                socket = dgram.createSocket('unix_dgram', function(msg) {
+                    topic.msg = msg.toString();
+                    // we just grab one message
+                    resolve();
+                });
+                bindWithOpenUmask(socket, monitor.ipcMonitorPath);
+            });
         });
-        after(function(done) {
-            // always do this cleanup
-            async.series([
-                (taskDone) => {
-                    socket.close();
-                    taskDone();
-                },
-                (taskDone) => {
-                    server.close(taskDone);
-                },
-                (taskDone) => {
-                    fs.unlink(monitor.ipcMonitorPath, taskDone);
-                },
-            ], done);
+
+        after(async function() {
+            socket.close();
+            await new Promise((resolve) => server.close(resolve));
+            await fsp.unlink(monitor.ipcMonitorPath);
         });
 
         it('should return values', function() {
@@ -154,61 +145,47 @@ describe('monitr', function() {
         });
 
         it('should have valid JSON', function() {
-            var msg = JSON.parse(topic.msg);
+            const msg = JSON.parse(topic.msg);
             assert.ok(Object.prototype.hasOwnProperty.call(msg, 'status'));
-            var status = msg.status;
+            const status = msg.status;
             assert.deepEqual(expectedProperties.sort(), Object.keys(status).sort());
-            var gc = status.gc;
+            const gc = status.gc;
             assert.deepEqual(expectedGCCollectors.sort(), Object.keys(gc).sort());
             Object.keys(gc).forEach((coll) => {
-                var fields = gc[coll];
+                const fields = gc[coll];
                 assert.deepEqual(expectedGCStatProperties.sort(), Object.keys(fields).sort());
             });
         });
     });
 
     describe('health check values', function() {
-        var socket;
-        var topic = {};
+        let socket;
+        const topic = {};
 
-        this.timeout(20000);
-        before(function(done) {
-            async.series([
-                (taskDone) => {
-                    monitor.setIpcMonitorPath(ipcMonitorPath);
-                    monitor.start();
-                    process.monitor.setHealthStatus(true, 200);
-                    taskDone();
-                },
-                (taskDone) => {
-                    socket = dgram.createSocket('unix_dgram', function(msg) {
-                        topic.isDown = process.monitor.isDown();
-                        topic.statusCode = process.monitor.getStatusCode();
-                        topic.statusTimestamp = process.monitor.getStatusTimestamp();
-                        topic.statusDate = process.monitor.getStatusDate();
-                        topic.msg = JSON.parse(msg.toString());
-                        // wait for one with health status
-                        if (topic.msg.status.health_status_code) {
-                            taskDone();
-                        }
-                    });
-                    var um = process.umask(0);
-                    socket.bind(monitor.ipcMonitorPath);
-                    process.umask(um);
-                },
-            ], done);
-        });
-        after(function(done) {
-            // always do this cleanup
-            async.series([
-                (taskDone) => {
-                    socket.close();
-                    taskDone();
-                },
-                (taskDone) => {
-                    fs.unlink(monitor.ipcMonitorPath, taskDone);
-                },
-            ], done);
+        before(async function() {
+            monitor.setIpcMonitorPath(ipcMonitorPath);
+            monitor.start();
+            process.monitor.setHealthStatus(true, 200);
+
+            await new Promise((resolve) => {
+                socket = dgram.createSocket('unix_dgram', function(msg) {
+                    topic.isDown = process.monitor.isDown();
+                    topic.statusCode = process.monitor.getStatusCode();
+                    topic.statusTimestamp = process.monitor.getStatusTimestamp();
+                    topic.statusDate = process.monitor.getStatusDate();
+                    topic.msg = JSON.parse(msg.toString());
+                    // wait for one with health status
+                    if (topic.msg.status.health_status_code) {
+                        resolve();
+                    }
+                });
+                bindWithOpenUmask(socket, monitor.ipcMonitorPath);
+            });
+        }, { timeout: 20000 });
+
+        after(async function() {
+            socket.close();
+            await fsp.unlink(monitor.ipcMonitorPath);
         });
 
         it('has valid information', function() {
