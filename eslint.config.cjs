@@ -1,31 +1,26 @@
-const globals = require("globals");
-const js = require("@eslint/js");
+const js = require('@eslint/js');
+const globals = require('globals');
 
-const {
-    FlatCompat,
-} = require("@eslint/eslintrc");
+module.exports = [
+    js.configs.recommended,
+    {
+        files: ['examples/**/*.js', 'lib/**/*.js', 'tests/**/*.js'],
+        languageOptions: {
+            ecmaVersion: 2022,
+            sourceType: 'commonjs',
+            globals: {
+                ...globals.node,
+            },
+        },
+        rules: {
+            indent: ['error', 4, {
+                SwitchCase: 1,
+            }],
 
-const compat = new FlatCompat({
-    baseDirectory: __dirname,
-    recommendedConfig: js.configs.recommended,
-    allConfig: js.configs.all
-});
-
-module.exports = [...compat.extends("eslint:recommended"), {
-    languageOptions: {
-        globals: {
-            ...globals.node,
+            'linebreak-style': ['error', 'unix'],
+            'no-console': 'off',
+            quotes: ['error', 'single'],
+            semi: ['error', 'always'],
         },
     },
-
-    rules: {
-        indent: ["error", 4, {
-            SwitchCase: 1,
-        }],
-
-        "linebreak-style": ["error", "unix"],
-        "no-console": "off",
-        quotes: ["error", "single"],
-        semi: ["error", "always"],
-    },
-}];
+];
